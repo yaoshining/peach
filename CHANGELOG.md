@@ -16,6 +16,8 @@ Entries are written for users to scan: one sentence each, saying where something
 
 ### Added / 新增
 
+- **Playback**: Cache requested cloud video blocks for smoother repeated reads (#2). / **播放**：缓存已请求的网盘视频数据块，改善重复读取（#2）。
+- **Sourcing**: Manual cover fetch can use community sources and labels watermarked JavDB images (#2). / **采集**：手动抓取封面可使用社区来源，并标注 JavDB 水印图（#2）。
 - **Playback**: Play verified mapped cloud files through a direct link while keeping their existing catalog records (#1). / **播放**：已核对的网盘文件可使用直链播放，保留原馆藏记录（#1）。
 - **Interface**: Right-click cards and table rows for item actions, use the Library action column, or delete from the icon group under a work's title (#773). / **界面**：卡片与表格行可右键操作，馆藏列表新增操作栏，作品详情的删除入口放在标题下方的按钮组（#773）。
 

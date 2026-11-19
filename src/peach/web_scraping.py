@@ -102,25 +102,71 @@ def _result(code: str, **params) -> dict:
     return {"result": interface_text.text(f"server:{code}", params), "result_code": code, "result_params": params}
 
 
+def _community_cover(contract, code):
+    """手动抓取落空时使用已配置的社区来源；只允许同番号的候选。"""
+    from .community_catalog import verified_cover
+    from .jav_cover_fetch import NotFound
+    from .library_processing import LibraryMetadataProvider, SourceBudget
+    from .metadata import identifies_code
+    provider = LibraryMetadataProvider(contract.follow_secrets_root,
+                                       budget=SourceBudget(requests=80, bytes=32 * 1024 * 1024, seconds=180))
+    try:
+        deadline = time.monotonic() + 180
+        answers = [(source, payload) for source, payload in provider.community(code, deadline=deadline)
+                   if identifies_code(code, payload)]
+        if not answers:
+            raise NotFound('errors.communityCatalog.noCovers')
+        candidate, size, data, verified_by = verified_cover(
+            provider.transport, code, answers, deadline=deadline, allow_watermarked=True)
+        return candidate, size, data, verified_by
+    finally:
+        provider.close()
+
+
+def _cached_manual_cover(target, code):
+    try:
+        installed = json.loads(target.with_suffix('.scraping.json').read_text(encoding='utf-8'))
+        if (time.time() - float(installed['checked_at']) < 86400 and target.is_file()
+                and hashlib.sha256(target.read_bytes()).hexdigest() == installed['raw_sha256']):
+            message = ('labels.webScraping.communityCoverSaved' if installed.get('fallback') == 'community'
+                       else 'labels.webScraping.reusedCover')
+            source = 'JavDB' if installed.get('watermarked') or installed.get('javdb_fallback') else installed.get('source', '')
+            result = {'ok': True, 'code': code, **_result(message, width=installed['width'],
+                      height=installed['height'], source=source)}
+            result.update({key: installed[key] for key in ('width', 'height', 'raw_sha256')})
+            return installed, result
+        return installed, None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, None
+
+
+def _manual_cover_candidate(contract, code, observed, prior, diagnostics):
+    from .jav_cover_fetch import best_cover, DeadlineExceeded, Unavailable
+    try:
+        candidate, size, data = best_cover(observed, code, 0, diagnostics=diagnostics,
+                                          prior_candidates=prior,
+                                          metadata_root=contract.follow_sources_root / 'metadata' / 'javinizer-go')
+        return candidate, size, data, (), False
+    except Unavailable as official_error:
+        try:
+            candidate, size, data, verified_by = _community_cover(contract, code)
+            return candidate, size, data, verified_by, True
+        except (Unavailable, SourcePaused, DeadlineExceeded):
+            raise official_error
+
+
 def _fetch_cover(contract, code):
     from .cover_artwork import install_cover, is_user_cover
-    from .jav_cover_fetch import (best_cover, HostLimitedTransport, Unavailable, dmm_portrait,
+    from .jav_cover_fetch import (HostLimitedTransport, Unavailable, dmm_portrait,
                                  fc2_cover_candidates, logged_success_evidence)
     from .review_csv import read_rows
     target = contract.cover_root / (code + ".jpg")
     # 编辑资料里换上的封面不联网替换；要换回刮削封面，在编辑资料里点「恢复刮削封面」（ADR-0165）。
     if is_user_cover(target):
         return {"ok": True, "code": code, "reason": "kept_existing", **_result("labels.webScraping.keptUserCover")}
-    sidecar = target.with_suffix(".scraping.json")
-    try:
-        installed = json.loads(sidecar.read_text(encoding="utf-8"))
-        if (time.time() - float(installed["checked_at"]) < 86400 and target.is_file()
-                and hashlib.sha256(target.read_bytes()).hexdigest() == installed["raw_sha256"]):
-            return {"ok": True, "code": code, **_result(
-                "labels.webScraping.reusedCover", width=installed["width"], height=installed["height"]), **{
-                key: installed[key] for key in ("width", "height", "raw_sha256")}}
-    except (OSError, ValueError, KeyError, TypeError):
-        installed = None
+    installed, cached = _cached_manual_cover(target, code)
+    if cached:
+        return cached
     raw = SourceTransport(contract.follow_secrets_root, max_requests=80,
                           max_bytes=32 * 1024 * 1024, max_seconds=180)
     transport = HostLimitedTransport(raw, 1.5)
@@ -143,9 +189,8 @@ def _fetch_cover(contract, code):
         log = contract.candidate_root / "cover-fetch-log.csv"
         previous = logged_success_evidence(read_rows(log), code) if log.is_file() else None
         prior = tuple(item for item in (fc2, previous[0] if previous else None) if item)
-        candidate, size, data = best_cover(observed, code, 0, diagnostics=diagnostics,
-                                          prior_candidates=prior,
-                                          metadata_root=contract.follow_sources_root / "metadata" / "javinizer-go")
+        candidate, size, data, verified_by, community = _manual_cover_candidate(
+            contract, code, observed, prior, diagnostics)
         kept_size = _kept_cover_size(target, candidate, size, installed, previous)
         if kept_size is not None:
             partial = network_failed or any(s >= 400 and s != 404 for s in statuses)
@@ -157,9 +202,14 @@ def _fetch_cover(contract, code):
                     "raw_sha256": hashlib.sha256(data).hexdigest(),
                     "installed_sha256": hashlib.sha256(data).hexdigest(),
                     "checked_at": time.time(), "resolver": "peach-jav-cover-v1"}
+        from .jav_cover_fetch import is_javdb_image
+        watermarked = community and is_javdb_image(candidate.url, candidate.source)
+        if community:
+            evidence.update(manual=True, fallback='community', verified_by=list(verified_by), watermarked=watermarked)
         install_cover(target, code, data, size, evidence=evidence,
                       portrait=dmm_portrait(observed, candidate.url))
-        return {"ok": True, "code": code, **_result("labels.webScraping.coverSaved"), "width": size[0],
+        message = 'labels.webScraping.communityCoverSaved' if community else 'labels.webScraping.coverSaved'
+        return {"ok": True, "code": code, **_result(message, source='JavDB' if watermarked else candidate.source), "width": size[0],
                 "height": size[1], "requests": raw.requests, "bytes": raw.bytes}
     except Unavailable as exc:
         reason, parts = _unavailable_reason(exc, network_failed, statuses)

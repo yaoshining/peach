@@ -3168,6 +3168,7 @@
     "webScraping": {
       "compareIncompleteMobileHint": "，未能完成封面比较；中国移动宽带直连 DMM 图片主机常在握手后被断开，请把 DMM / FANZA 的连接方式设成 Peach 代理。",
       "coverSaved": "高清封面已保存",
+      "communityCoverSaved": "社区封面已保存（来源：{{source}}，可能带水印）",
       "diagnosticDimensionMismatch": "完整图片尺寸与探测结果不一致 {{count}} 张",
       "diagnosticDownloadFailed": "完整下载失败 {{count}} 张",
       "diagnosticInvalidImage": "图片无法解码 {{count}} 张",

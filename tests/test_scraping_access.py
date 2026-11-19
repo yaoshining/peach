@@ -675,6 +675,60 @@ class ScrapingAccessTests(unittest.TestCase):
         save(self.root, "javten", {"cookie": "cf_clearance=new"})
         self.assertFalse(cooldown.exists())
 
+    def test_manual_cover_uses_community_after_official_failure(self):
+        from peach.web_scraping import _fetch_cover
+        from peach.jav_cover_fetch import Candidate, NotFound
+        contract = SimpleNamespace(cover_root=self.root / "covers", candidate_root=self.root,
+                                   follow_secrets_root=self.root / "secrets", follow_sources_root=self.root)
+        candidate = Candidate("javdb", "https://javdb.com/fixture.jpg")
+        with patch("peach.jav_cover_fetch.best_cover", side_effect=NotFound("errors.javCoverFetch.noCandidates")), \
+                patch("peach.web_scraping._community_cover", return_value=(candidate, (1600, 1000), b"image", ())), \
+                patch("peach.cover_artwork.install_cover") as install, \
+                patch("peach.jav_cover_fetch.dmm_portrait", return_value=None):
+            result = _fetch_cover(contract, "ABW-232")
+        self.assertTrue(result["ok"])
+        self.assertIn("javdb", result["result"].lower())
+        self.assertTrue(install.call_args.kwargs["evidence"]["watermarked"])
+        self.assertTrue(install.call_args.kwargs["evidence"]["manual"])
+
+    def test_manual_community_filters_mismatched_titles_and_closes_provider(self):
+        from peach.web_scraping import _community_cover
+        contract = SimpleNamespace(follow_secrets_root=self.root)
+        with patch("peach.library_processing.LibraryMetadataProvider") as factory, \
+                patch("peach.metadata.identifies_code", side_effect=[False, True]), \
+                patch("peach.community_catalog.verified_cover", return_value=("candidate", (1, 1), b"data", ())) as verify:
+            provider = factory.return_value
+            provider.community.return_value = [("wrong", {}), ("javdb", {})]
+            self.assertEqual(_community_cover(contract, "ABW-232")[0], "candidate")
+            self.assertEqual(verify.call_args.args[2], [("javdb", {})])
+            self.assertTrue(verify.call_args.kwargs["allow_watermarked"])
+            provider.close.assert_called_once()
+
+    def test_manual_community_timeout_preserves_official_connection_error(self):
+        from peach.web_scraping import _manual_cover_candidate
+        from peach.jav_cover_fetch import CoverConnectError, DeadlineExceeded
+        contract = SimpleNamespace(follow_sources_root=self.root)
+        official = CoverConnectError('errors.javCoverFetch.hostsUnreachable')
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=official), \
+                patch('peach.web_scraping._community_cover', side_effect=DeadlineExceeded('errors.libraryProcessing.deadlineRetryLater')):
+            with self.assertRaises(CoverConnectError) as caught:
+                _manual_cover_candidate(contract, 'ABW-232', None, (), {})
+        self.assertIs(caught.exception, official)
+
+    def test_cached_manual_community_cover_still_shows_source(self):
+        from peach.web_scraping import _fetch_cover
+        import hashlib
+        target = self.root / 'ABW-232.jpg'
+        target.write_bytes(b'previous cover')
+        target.with_suffix('.scraping.json').write_text(json.dumps({
+            'checked_at': time.time(), 'raw_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+            'width': 1600, 'height': 1000, 'fallback': 'community', 'source': 'javdb',
+        }), encoding='utf-8')
+        contract = SimpleNamespace(cover_root=self.root)
+        result = _fetch_cover(contract, 'ABW-232')
+        self.assertTrue(result['ok'])
+        self.assertIn('javdb', result['result'].lower())
+
     def test_full_quality_bytes_are_installed_and_cache_avoids_download(self):
         from peach.web_scraping import _fetch_cover
         from peach.jav_cover_fetch import Candidate
@@ -753,6 +807,7 @@ class ScrapingAccessTests(unittest.TestCase):
                     pass
                 raise NotFound("errors.javCoverFetch.noCandidates")
             with self.subTest(reason=reason), patch("peach.jav_cover_fetch.best_cover", side_effect=fetch), \
+                    patch("peach.web_scraping._community_cover", side_effect=NotFound("errors.communityCatalog.noCovers")), \
                     patch("peach.web_scraping.SourceTransport") as factory:
                 if status is None:
                     factory.return_value.side_effect = httpx.ConnectError("private?token=secret")
@@ -773,6 +828,7 @@ class ScrapingAccessTests(unittest.TestCase):
         contract = SimpleNamespace(cover_root=self.root, candidate_root=self.root,
                                    follow_secrets_root=self.root / "secrets", follow_sources_root=self.root)
         with patch("peach.jav_cover_fetch.best_cover", side_effect=CoverConnectError(HOSTS_UNREACHABLE_CODE)), \
+                patch("peach.web_scraping._community_cover", side_effect=CoverConnectError(HOSTS_UNREACHABLE_CODE)), \
                 patch("peach.web_scraping.SourceTransport"):
             result = _fetch_cover(contract, "ABW-232")
         self.assertEqual(result["reason"], "network")
