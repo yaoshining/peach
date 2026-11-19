@@ -364,6 +364,33 @@ def external_playlist(request: Request, id: int, ticket: str, origin: str = ''):
                                       "Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
+def _direct_playback_response(state, asset, request, session, direct):
+    """解析已授权的直链，失败时交给兼容播放计划。"""
+    from . import direct_playback
+    target = direct_playback.mapped_url(state.settings.follow_state_root, asset) if direct else None
+    automatic = direct_playback.automatic_source(state.settings.follow_state_root, asset) if direct and not target else None
+    if target and session and state.stream_sessions.is_cancelled(session):
+        return Response(status_code=410)
+    if automatic and session and state.stream_sessions.is_cancelled(session):
+        return Response(status_code=410)
+    if automatic:
+        target = direct_playback.automatic_url(automatic)
+        if not target and session:
+            return Response(status_code=503, headers={'Cache-Control': 'no-store'})
+    if target:
+        location = (direct_playback.resolve_automatic(target, request.headers.get('user-agent', ''))
+                    if automatic else direct_playback.resolve(target, request.headers.get('user-agent', '')))
+        if location:
+            return RedirectResponse(location, status_code=302, headers={
+                'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
+            })
+        if automatic:
+            direct_playback.invalidate_automatic(asset)
+        if session:
+            return Response(status_code=503, headers={'Cache-Control': 'no-store'})
+    return None
+
+
 @router.api_route("/stream", methods=["GET", "HEAD"])
 def stream(request: Request, id: int, session: str = "", decode: str = "", original: bool = False,
            direct: bool = True,
@@ -373,18 +400,9 @@ def stream(request: Request, id: int, session: str = "", decode: str = "", origi
     local_event('playback-request', asset_id=id, method=request.method,
                 range=request.headers.get('range', '')[:80], user_agent=request.headers.get('user-agent', '')[:512])
     asset = state.media_engine.asset(id)
-    from . import direct_playback
-    target = direct_playback.mapped_url(state.settings.follow_state_root, asset) if direct else None
-    if target and session and state.stream_sessions.is_cancelled(session):
-        return Response(status_code=410)
-    if target:
-        location = direct_playback.resolve(target, request.headers.get('user-agent', ''))
-        if location:
-            return RedirectResponse(location, status_code=302, headers={
-                'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
-            })
-        if session:
-            return Response(status_code=503, headers={'Cache-Control': 'no-store'})
+    direct_response = _direct_playback_response(state, asset, request, session, direct)
+    if direct_response is not None:
+        return direct_response
     # 每个 Range 请求只检查一次挂载，供后续响应复用。
     path, source_stat = state.media_engine.filesystem.located(asset)
     from . import strm, strm_stream
@@ -444,7 +462,8 @@ def stream_plan(request: Request, id: int, session: str = "", mode: str = "", de
         return JSONResponse({"error": "stream cancelled"}, status_code=410)
     asset = state.media_engine.asset(id)
     from . import direct_playback
-    if direct and direct_playback.mapped_url(state.settings.follow_state_root, asset):
+    if direct and (direct_playback.mapped_url(state.settings.follow_state_root, asset)
+                   or direct_playback.automatic_source(state.settings.follow_state_root, asset)):
         suffix = Path(asset.path or '').suffix.lower()
         mime = {'.mkv': 'video/x-matroska', '.webm': 'video/webm'}.get(suffix, 'video/mp4')
         return {'id': id, 'protocol': 'range', 'mime_type': mime, 'duration': asset.duration,

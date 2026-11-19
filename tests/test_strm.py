@@ -1,5 +1,7 @@
 """STRM 入库、按需播放与媒体读取模式的行为回归。"""
 import json
+import logging
+import os
 import sqlite3
 import tempfile
 import threading
@@ -147,6 +149,144 @@ class StrmPlaybackTests(unittest.TestCase):
         self.requests.append(request)
         return httpx.Response(206, content=b'video', headers={
             'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-4/100', 'Accept-Ranges': 'bytes'})
+
+    def test_automatic_115_uses_authenticated_query_cache_and_preserves_ledger(self):
+        windows_path = r'R:\media\video.mp4'
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET location=?,path=?,size=?,rating=?,play_count=?,watch_ratio=? WHERE id=1',
+                               ('115', windows_path, 123, 4, 2, 0.3))
+            connection.execute("INSERT INTO playlist(id,profile_id,name,source_kind,created_at,updated_at) "
+                               "VALUES(1,'local-default','测试','manual','now','now')")
+            connection.execute("INSERT INTO playlist_item(playlist_id,asset_id,position,added_at) VALUES(1,1,0,'now')")
+            connection.execute("INSERT INTO activity_event(asset_id,kind,occurred_at,position_seconds,source) "
+                               "VALUES(1,'progress','2026-01-01',30,'test')")
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / direct_playback.FILENAME).write_text(json.dumps({'automatic': {
+            'enabled': True, 'endpoint': 'http://127.0.0.1:12333', 'user_id': '42',
+            'ledger_root': r'R:\media'}}), encoding='utf-8')
+        calls = []
+        def serve_query(request):
+            calls.append((request.url.path, request.headers.get('authorization'), json.loads(request.content)))
+            return httpx.Response(200, json={'code': 200, 'data': {'file_id': 'id', 'pick_code': 'abc123', 'size': 123}})
+        original_client = httpx.Client
+        def safe_factory(**kwargs):
+            return original_client(transport=httpx.MockTransport(serve_query))
+        with patch.dict(os.environ, {direct_playback.AUTO_TOKEN_ENV: 'x' * 32}), \
+                patch('peach.direct_playback.httpx.Client', side_effect=safe_factory), \
+                patch('peach.direct_playback.resolve_automatic', return_value='https://cdn.example/video') as resolve:
+            with route_client(self.app) as client:
+                plan = client.get('/api/stream-plan?id=1&session=one').json()
+                first = client.get(plan['src'], headers={'User-Agent': 'player-test'}, follow_redirects=False)
+                second = client.get(plan['src'], headers={'User-Agent': 'player-test'}, follow_redirects=False)
+        self.assertEqual(plan['reason'], 'direct-playback')
+        self.assertEqual((first.status_code, second.status_code), (302, 302))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ('/internal/peach/115/resolve', 'Bearer ' + 'x' * 32,
+                                    {'path': 'video.mp4', 'size': 123}))
+        self.assertEqual(resolve.call_count, 2)
+        self.assertNotIn('abc123', json.dumps(plan))
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute('SELECT path,rating,play_count,watch_ratio FROM asset WHERE id=1').fetchone(),
+                             (windows_path, 4, 2, 0.3))
+            self.assertEqual(connection.execute('SELECT playlist_id,asset_id FROM playlist_item').fetchall(), [(1, 1)])
+            self.assertEqual(connection.execute('SELECT asset_id,position_seconds FROM activity_event').fetchall(), [(1, 30)])
+
+    def test_automatic_115_rejects_wrong_scope_and_clears_failed_cache(self):
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        config = {'automatic': {'enabled': True, 'endpoint': 'http://127.0.0.1:12333',
+                                'user_id': '42', 'ledger_root': r'R:\media'}}
+        (state / direct_playback.FILENAME).write_text(json.dumps(config), encoding='utf-8')
+        asset = SimpleNamespace(id=98765, path=r'R:\media\video.mp4', location='115', size=123)
+        with patch.dict(os.environ, {direct_playback.AUTO_TOKEN_ENV: 'x' * 32}):
+            source = direct_playback.automatic_source(state, asset)
+            self.assertIsNotNone(source)
+            self.assertNotIn('x' * 32, repr(source))
+            for bad in (SimpleNamespace(**(vars(asset) | change)) for change in (
+                    {'location': 'local'}, {'path': r'R:\other\video.mp4'},
+                    {'path': r'R:\media\..\video.mp4'}, {'size': 0})):
+                self.assertIsNone(direct_playback.automatic_source(state, bad))
+            config['automatic']['endpoint'] = 'https://public.example:12333'
+            (state / direct_playback.FILENAME).write_text(json.dumps(config), encoding='utf-8')
+            self.assertIsNone(direct_playback.automatic_source(state, asset))
+            config['automatic']['endpoint'] = 'http://169.254.1.1:12333'
+            (state / direct_playback.FILENAME).write_text(json.dumps(config), encoding='utf-8')
+            self.assertIsNone(direct_playback.automatic_source(state, asset))
+        direct_playback.invalidate_automatic(asset)
+
+    def test_automatic_lookup_failure_replans_hls_from_mount(self):
+        video = self.root / 'video.mp4'
+        video.write_bytes(b'video')
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET location=?,path=?,size=?,duration=? WHERE id=1',
+                               ('115', r'R:\media\video.mp4', 5, 120))
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / direct_playback.FILENAME).write_text(json.dumps({'automatic': {
+            'enabled': True, 'endpoint': 'http://127.0.0.1:12333', 'user_id': '42',
+            'ledger_root': r'R:\media'}}), encoding='utf-8')
+        filesystem = self.app.state.media_engine.filesystem
+        service = self.app.state.transcode_service
+        with patch.dict(os.environ, {direct_playback.AUTO_TOKEN_ENV: 'y' * 32}), \
+                patch('peach.direct_playback.automatic_url', return_value=None), \
+                patch.object(filesystem, 'file_for', return_value=video), \
+                patch('peach.routes_media._needs_conversion', return_value=True), \
+                patch.object(service, 'remuxes', return_value=False), \
+                patch('peach.routes_media._hls_plan', return_value=(None, None, [(0, 6)], 'transcode')), \
+                route_client(self.app) as client:
+            plan = client.get('/api/stream-plan?id=1&session=one').json()
+            failed = client.get(plan['src'])
+            fallback = client.get('/api/stream-plan?id=1&session=one&direct=0').json()
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual((fallback['protocol'], fallback['mime_type']), ('hls', 'application/vnd.apple.mpegurl'))
+
+    def test_automatic_115_real_http_contract_and_private_logging(self):
+        requests = []
+        class Resolver(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                requests.append(('post', self.path, self.headers.get('Authorization'), body))
+                data = json.dumps({'code': 200, 'data': {'file_id': '123', 'pick_code': 'secretcode', 'size': 123}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_GET(self):
+                requests.append(('get', self.path, self.headers.get('User-Agent')))
+                self.send_response(302)
+                self.send_header('Location', 'https://cdn.example/video?signature=private')
+                self.end_headers()
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Resolver)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        endpoint = f'http://127.0.0.1:{server.server_port}'
+        (state / direct_playback.FILENAME).write_text(json.dumps({'automatic': {
+            'enabled': True, 'endpoint': endpoint, 'user_id': '42', 'ledger_root': r'R:\media'}}), encoding='utf-8')
+        asset = SimpleNamespace(id=999999, path=r'R:\media\video.mp4', location='115', size=123)
+        self.addCleanup(direct_playback.invalidate_automatic, asset)
+        with patch.dict(os.environ, {direct_playback.AUTO_TOKEN_ENV: 'z' * 32}), \
+                patch('peach.direct_playback.resolves_publicly', return_value=True), \
+                self.assertLogs('httpx', level=logging.INFO) as logs:
+            source = direct_playback.automatic_source(state, asset)
+            url = direct_playback.automatic_url(source)
+            result = direct_playback.resolve_automatic(url, 'real-player')
+            self.assertEqual(direct_playback.automatic_url(source), url)
+        self.assertEqual(result, 'https://cdn.example/video?signature=private')
+        self.assertEqual(len([r for r in requests if r[0] == 'post']), 1)
+        self.assertEqual(requests[0][2:], ('Bearer ' + 'z' * 32, {'path': 'video.mp4', 'size': 123}))
+        self.assertEqual(requests[1][2], 'real-player')
+        for record in logs.output:
+            self.assertNotIn('secretcode', record)
+            self.assertNotIn('z' * 32, record)
 
     def test_direct_mapping_preserves_asset_and_forwards_player_user_agent(self):
         video = self.root / 'ABC-123.mp4'
