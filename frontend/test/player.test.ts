@@ -85,7 +85,7 @@ describe('片源判据', () => {
       .toEqual({ src: '/stream/hls/3/index.m3u8', type: 'application/vnd.apple.mpegurl' });
     vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }));
     expect(await playableStreamSource({ id: 3, name: 'a.WEBM' }, 's 2'))
-      .toEqual({ src: '/stream?id=3&session=s%202', type: 'video/webm' });
+      .toEqual({ src: '/stream?id=3&session=s%202&direct=0', type: 'video/webm' });
     expect(directStreamSource({ id: 4 }, 'x').type).toBe('video/mp4');
   });
 

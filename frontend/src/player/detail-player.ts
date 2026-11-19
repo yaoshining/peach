@@ -271,7 +271,8 @@ export async function mountDetailPlayer(
     if (!live()) return;
     const segmented = String(next.type || '').includes('mpegurl');
     const first = { ...next, fallback: next.fallback ?? (segmented ? directDetailSource(item) : undefined) };
-    takeFallback = streamFallbackChain(first, options.source ? undefined : () => detailFallbackSource(item));
+    takeFallback = streamFallbackChain(first, options.source ? undefined : (failed, error) =>
+      detailFallbackSource(item, failed.direct === true, Number((error as { code?: number } | null)?.code) === 2));
     if (resume && resume.time > 0) player.one('loadedmetadata', () => {
       if (player.isDisposed()) return;
       const duration = realDuration(player.el().querySelector('video')?.duration) || realDuration(player.duration());

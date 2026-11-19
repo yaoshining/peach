@@ -46,7 +46,8 @@ export function mountImmersePlayer(video: HTMLVideoElement, options: ImmersePlay
     const direct = directStreamSource(item, session);
     const segmented = String(source.type || '').includes('mpegurl');
     const first = { ...source, fallback: source.fallback ?? (segmented ? direct : undefined) };
-    const takeFallback = streamFallbackChain(first, () => fallbackStreamSource(item, session));
+    const takeFallback = streamFallbackChain(first, (failed, error) =>
+      fallbackStreamSource(item, session, failed.direct === true, Number((error as { code?: number } | null)?.code) === 2));
     // 播放器脚本拉不到时退回原生 video；原生元素播不了分片，只能直读。
     if (!vjs) video.src = (segmented ? direct : source).src;
     else {

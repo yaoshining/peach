@@ -18,6 +18,8 @@ export interface PlayerSource {
   decode?: string;
   /** 原文件试播：浏览器可能放不了，要盯着首帧。 */
   trial?: boolean;
+  /** 直链失败时延迟请求原挂载的兼容播放计划。 */
+  direct?: boolean;
   /** 媒体不兼容时的下一条片源，按链顺序尝试。 */
   fallback?: PlayerSource | undefined;
 }

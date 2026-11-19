@@ -14,7 +14,7 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
-from peach import access, media_processing_policy as policy, settings_file, strm
+from peach import access, direct_playback, media_processing_policy as policy, settings_file, strm
 from peach.api import create_app
 from peach.config import PeachSettings
 from peach.media_probe import probe_unmeasured
@@ -147,6 +147,121 @@ class StrmPlaybackTests(unittest.TestCase):
         self.requests.append(request)
         return httpx.Response(206, content=b'video', headers={
             'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-4/100', 'Accept-Ranges': 'bytes'})
+
+    def test_direct_mapping_preserves_asset_and_forwards_player_user_agent(self):
+        video = self.root / 'ABC-123.mp4'
+        video.write_bytes(b'original')
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET path=?,name=?,rating=4,play_count=2,watch_ratio=0.3 WHERE id=1',
+                               (str(video), video.name))
+            connection.execute("INSERT INTO playlist(id,profile_id,name,source_kind,created_at,updated_at) "
+                               "VALUES(1,'local-default','测试','manual','now','now')")
+            connection.execute("INSERT INTO playlist_item(playlist_id,asset_id,position,added_at) VALUES(1,1,0,'now')")
+            connection.execute("INSERT INTO activity_event(asset_id,kind,occurred_at,position_seconds,source) "
+                               "VALUES(1,'progress','2026-01-01',30,'test')")
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        endpoint = 'http://127.0.0.1:12333/115/url/video.mp4?pickcode=example&userid=42'
+        (state / direct_playback.FILENAME).write_text(json.dumps({'assets': {
+            '1': {'path': str(video), 'location': 'local', 'url': endpoint}}}), encoding='utf-8')
+        with patch('peach.direct_playback.resolve', return_value='https://cdn.example/video?secret=1') as resolve:
+            with route_client(self.app) as client:
+                plan = client.get('/api/stream-plan?id=1&session=one').json()
+                response = client.get('/stream?id=1&session=one', headers={'User-Agent': 'player-test'},
+                                      follow_redirects=False)
+        self.assertEqual(plan['reason'], 'direct-playback')
+        self.assertIn('original=1', plan['src'])
+        self.assertNotIn('example', json.dumps(plan))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['location'], 'https://cdn.example/video?secret=1')
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+        resolve.assert_called_once_with(endpoint, 'player-test')
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute('SELECT id,path,rating,play_count,watch_ratio FROM asset').fetchone(),
+                             (1, str(video), 4, 2, 0.3))
+            self.assertEqual(connection.execute('SELECT playlist_id,asset_id FROM playlist_item').fetchall(), [(1, 1)])
+            self.assertEqual(connection.execute('SELECT asset_id,position_seconds FROM activity_event').fetchall(),
+                             [(1, 30)])
+        with patch('peach.direct_playback.resolve', return_value=None), route_client(self.app) as client:
+            fallback = client.get('/stream?id=1&session=one&original=1')
+        self.assertEqual(fallback.status_code, 503)
+        with patch('peach.direct_playback.resolve') as resolve, route_client(self.app) as client:
+            fallback = client.get('/stream?id=1&session=one&original=1&direct=0')
+        resolve.assert_not_called()
+        self.assertEqual((fallback.status_code, fallback.content), (200, b'original'))
+
+    def test_direct_mapping_rejects_mismatched_path_and_untrusted_endpoint(self):
+        asset = SimpleNamespace(id=1, path='R:\\media\\one.mp4', location='115')
+        config = self.root / direct_playback.FILENAME
+        def write(path, url):
+            config.write_text(json.dumps({'assets': {'1': {'path': path, 'location': '115', 'url': url}}}), encoding='utf-8')
+        valid = 'http://127.0.0.1:12333/115/newurl?pickcode=a&userid=42'
+        write(asset.path, valid)
+        self.assertEqual(direct_playback.mapped_url(self.root, asset), valid)
+        for path, url in (('R:\\media\\other.mp4', valid),
+                          (asset.path, 'https://public.example/115/newurl?pickcode=a&userid=42'),
+                          (asset.path, 'http://127.0.0.1:12333/admin?pickcode=a&userid=42'),
+                          (asset.path, 'http://127.0.0.1:12333/115/url/../../admin?pickcode=a&userid=42'),
+                          (asset.path, 'http://127.0.0.1:12333/115/url/%2e%2e/admin?pickcode=a&userid=42'),
+                          (asset.path, valid + 'x' * 65536)):
+            write(path, url)
+            self.assertIsNone(direct_playback.mapped_url(self.root, asset))
+
+    def test_direct_plan_keeps_the_webm_media_type(self):
+        video = self.root / 'ABC-123.webm'
+        video.write_bytes(b'video')
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET path=?,name=? WHERE id=1', (str(video), video.name))
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / direct_playback.FILENAME).write_text(json.dumps({'assets': {'1': {
+            'path': str(video), 'location': 'local',
+            'url': 'http://127.0.0.1:12333/115/newurl?pickcode=example&userid=42'}}}), encoding='utf-8')
+        with route_client(self.app) as client:
+            result = client.get('/api/stream-plan?id=1').json()
+        self.assertEqual((result['reason'], result['mime_type']), ('direct-playback', 'video/webm'))
+        with patch('peach.routes_media._needs_conversion', return_value=False), route_client(self.app) as client:
+            fallback = client.get('/api/stream-plan?id=1&direct=0').json()
+        self.assertEqual((fallback['mime_type'], fallback['src']), ('video/webm', '/stream?id=1&direct=0'))
+
+    def test_direct_playback_does_not_read_offline_mount_and_replans_hls_on_failure(self):
+        asset_path = self.root / 'offline.mp4'
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET path=?,name=?,duration=120 WHERE id=1', (str(asset_path), 'offline.mp4'))
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / direct_playback.FILENAME).write_text(json.dumps({'assets': {'1': {
+            'path': str(asset_path), 'location': 'local',
+            'url': 'http://127.0.0.1:12333/115/newurl?pickcode=example&userid=42'}}}), encoding='utf-8')
+        filesystem = self.app.state.media_engine.filesystem
+        with patch.object(filesystem, 'file_for', side_effect=AssertionError('mount read')), \
+                patch.object(filesystem, 'located', side_effect=AssertionError('mount read')), \
+                patch('peach.direct_playback.resolve', return_value='https://cdn.example/video'):
+            with route_client(self.app) as client:
+                plan = client.get('/api/stream-plan?id=1&session=one').json()
+                response = client.get(plan['src'], follow_redirects=False)
+        self.assertEqual((plan['reason'], response.status_code), ('direct-playback', 302))
+        asset_path.write_bytes(b'video')
+        service = self.app.state.transcode_service
+        with patch('peach.routes_media._needs_conversion', return_value=True), \
+                patch.object(service, 'remuxes', return_value=False), \
+                patch('peach.routes_media._hls_plan', return_value=(None, None, [(0, 6)], 'transcode')), \
+                route_client(self.app) as client:
+            fallback = client.get('/api/stream-plan?id=1&session=one&direct=0').json()
+        self.assertEqual((fallback['protocol'], fallback['mime_type']), ('hls', 'application/vnd.apple.mpegurl'))
+
+    def test_invalid_httpx_url_falls_back_without_raising(self):
+        self.assertIsNone(direct_playback.resolve('http://127.0.0.1:12333/' + 'x' * 65536, 'test'))
+
+    def test_direct_resolver_does_not_follow_or_accept_nonpublic_redirects(self):
+        request = httpx.Request('GET', 'http://127.0.0.1:12333/115/newurl')
+        for location in ('http://127.0.0.1/admin', 'https://127.0.0.1/admin', 'https://cdn.example/video'):
+            response = httpx.Response(302, headers={'location': location}, request=request)
+            client = httpx.Client(transport=httpx.MockTransport(lambda _, result=response: result))
+            with patch('peach.direct_playback.httpx.Client', return_value=client), \
+                    patch('peach.direct_playback.resolves_publicly', return_value=True):
+                result = direct_playback.resolve(str(request.url), 'test-agent')
+            self.assertEqual(result, location if location.startswith('https://cdn.') else None)
 
     def test_browsing_and_stream_plan_do_not_access_remote_video(self):
         with route_client(self.app) as client:

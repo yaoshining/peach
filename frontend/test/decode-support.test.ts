@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   FIRST_FRAME_MS, decodeParam, rememberDecodeFailure, resetDecodeProbe, watchDecoding,
 } from '../src/player/decode-support';
-import { fallbackStreamSource, playableStreamSource } from '../src/player/stream';
+import { fallbackStreamSource, playableStreamSource, streamFallbackChain, watchesDecoding } from '../src/player/stream';
 
 function browserDecodes(codecs: string[], supported = true) {
   vi.spyOn(HTMLMediaElement.prototype, 'canPlayType')
@@ -62,6 +62,47 @@ describe('解码能力探测', () => {
 });
 
 describe('起播计划带上能力', () => {
+  it('直链未出画或网络失败时按需取得原挂载的分片计划', async () => {
+    browserDecodes([]);
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      urls.push(url);
+      const plan = url.includes('direct=0')
+        ? { protocol: 'hls', src: '/stream/hls/7/index.m3u8', mime_type: 'application/vnd.apple.mpegurl' }
+        : { protocol: 'range', src: '/stream?id=7&original=1', mime_type: 'video/mp4', reason: 'direct-playback' };
+      return new Response(JSON.stringify(plan), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    const item = { id: 7 };
+    for (const code of [2, 3]) {
+      const direct = await playableStreamSource(item, 's');
+      expect(watchesDecoding(direct)).toBe(true);
+      const next = streamFallbackChain(direct, (failed, error) => fallbackStreamSource(
+        item, 's', failed.direct === true, Number((error as { code?: number }).code) === 2));
+      expect(await next({ code }, direct)).toEqual({ src: '/stream/hls/7/index.m3u8', type: 'application/vnd.apple.mpegurl' });
+    }
+    expect(urls.filter(url => url.includes('&direct=0'))).toHaveLength(2);
+  });
+
+  it('回退计划请求失败时仍绕过直链', async () => {
+    browserDecodes([]);
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }));
+    expect(await fallbackStreamSource({ id: 7 }, 's', true, true)).toEqual({
+      src: '/stream?id=7&session=s&direct=0', type: 'video/mp4',
+    });
+  });
+  it('初始播放计划请求失败时绕过直链', async () => {
+    browserDecodes([]);
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }));
+    expect(await playableStreamSource({ id: 7 }, 's')).toEqual({
+      src: '/stream?id=7&session=s&direct=0', type: 'video/mp4',
+    });
+  });
+  it('直链格式错误不记录全局 HEVC 解码失败', async () => {
+    browserDecodes(['hvc1.1.6']);
+    plans();
+    await fallbackStreamSource({ id: 7 }, 's', true, false);
+    expect(await decodeParam()).toBe('hevc');
+  });
   it('报了能解时计划带 decode，片源记着它；回退时记下失败、换不带能力的计划', async () => {
     browserDecodes(['hvc1.1.6']);
     const urls = plans();
