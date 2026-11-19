@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import socketserver
 import sqlite3
 import tempfile
 import threading
@@ -240,6 +241,32 @@ class StrmPlaybackTests(unittest.TestCase):
             fallback = client.get('/api/stream-plan?id=1&session=one&direct=0').json()
         self.assertEqual(failed.status_code, 503)
         self.assertEqual((fallback['protocol'], fallback['mime_type']), ('hls', 'application/vnd.apple.mpegurl'))
+
+    def test_malformed_direct_response_returns_to_mount_without_session(self):
+        class MalformedStatus(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(4096)
+                self.request.sendall(b'INVALID STATUS\r\n\r\n')
+        server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), MalformedStatus)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f'http://127.0.0.1:{server.server_address[1]}/115/newurl'
+        self.assertIsNone(direct_playback.resolve_automatic(url, 'test-player'))
+        video = self.root / 'fallback.mp4'
+        video.write_bytes(b'original')
+        filesystem = self.app.state.media_engine.filesystem
+        with patch('peach.direct_playback.automatic_source', return_value=object()), \
+                patch('peach.direct_playback.automatic_url', return_value=url), \
+                patch('peach.direct_playback.invalidate_automatic') as invalidate, \
+                patch.object(filesystem, 'located', return_value=(video, video.stat())), \
+                patch('peach.routes_media._repaired_header', return_value=None), \
+                route_client(self.app) as client:
+            response = client.get('/stream?id=1&original=1')
+        invalidate.assert_called_once()
+        self.assertEqual((response.status_code, response.content), (200, b'original'))
 
     def test_automatic_115_real_http_contract_and_private_logging(self):
         requests = []

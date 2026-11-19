@@ -1,8 +1,8 @@
 """可选的单资产直链映射，不修改账本里的媒体路径。"""
 from __future__ import annotations
 
-import ipaddress
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -10,6 +10,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
@@ -155,7 +156,7 @@ def resolve_automatic(url: str, user_agent: str) -> str | None:
         if not public_https_url(target) or not resolves_publicly(urlsplit(target).hostname or ''):
             return None
         return target
-    except (URLError, OSError, ValueError, TypeError):
+    except (URLError, OSError, ValueError, TypeError, HTTPException):
         return None
 
 

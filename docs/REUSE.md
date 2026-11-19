@@ -416,7 +416,7 @@ MKV 的关键帧索引复用 [ebmlite 3.4.1](https://pypi.org/project/ebmlite/3.
 
 STRM 采用文本指针、播放时解析的通用行为，参考 SmartStrm 文档、OpenList 的 `drivers/strm` 与 Jellyfin 的 STRM 探测入口；固定 revision、许可证与实际读取位置见 [取证记录](reference-snapshots/strm-source-evidence.md)。SmartStrm 核心闭源，源码未取得。Peach 独立实现受限 HTTP(S) 指针，复用 HTTPX、现有 Range 传输、`m3u8` 解析与播放器计划；无新增运行依赖，也不复制上游应用代码。
 
-用户可选的 QMediaSync 115 直链复用 HTTPX 与受限公网 HTTPS 校验，通过经复核的资产映射保留原始账本身份；终端接收临时上游链接的例外和回退范围见 [ADR-0174](adr/0174-opt-in-mapped-direct-playback.md)。
+用户可选的 QMediaSync 115 直链复用 HTTPX 与受限公网 HTTPS 校验，通过经复核的资产映射或按需路径查询保留原始账本身份；终端接收临时上游链接的例外和回退范围见 [ADR-0174](adr/0174-opt-in-mapped-direct-playback.md) 与 [ADR-0175](adr/0175-opt-in-automatic-115-direct-playback.md)。
 
 光鸭、OneDrive 与其他网盘复用声明挂载根、路径翻译、扫描、文件整理与回滚、隔离删除和空目录清理。所有挂载来源统一开放读写，底层权限或不支持的操作由挂载工具报错；网盘登录与平台 API 由飞牛 OS 原生远程挂载、CloudDrive2 或 OpenList 等挂载工具提供，不新增 SDK 或依赖。本地文件先隔离再提交账本；rclone FUSE 通过挂载表识别并直接删除，避免部分后端的远端改名触发复制，账本事务失败时保留可重试的回收站记录。飞牛 OS 原生挂载 115 的实际文件系统可报告为 `fuse.rclone`，不等于用户单独部署 rclone；其他挂载方式仍须分别验证。临时文件与账本回归覆盖三个来源的整理、回滚、删除、权限拒绝和空目录清理；真实账号兼容性见待办。挂载目录可单独设置代理流量保护，成本投影与批处理使用同一规则。STRM、ISO 跳过后台媒体读取，普通媒体保留按来源策略执行的探测；九宫格和时间轴共用本机视频预览开关。
 
