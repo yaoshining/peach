@@ -4,7 +4,7 @@ from __future__ import annotations
 import ipaddress
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 
@@ -28,16 +28,21 @@ def mapped_url(root: Path, asset) -> str | None:
             return None
         url = row.get('url', '')
         parsed = urlsplit(url)
+        decoded_path = unquote(parsed.path)
+        actual_path = httpx.URL(url).path
         ip = ipaddress.ip_address(parsed.hostname or '')
         query = parse_qs(parsed.query)
         if (parsed.scheme not in {'http', 'https'} or not ip.is_private
                 or parsed.username or parsed.password or parsed.fragment
                 or parsed.port in (None, 0)
+                or '%' in decoded_path or '\\' in decoded_path
+                or any(part in {'.', '..'} for part in decoded_path.split('/'))
+                or not (actual_path == '/115/newurl' or actual_path.startswith('/115/url/'))
                 or not (parsed.path == '/115/newurl' or parsed.path.startswith('/115/url/'))
                 or len(query.get('pickcode', [])) != 1 or len(query.get('userid', [])) != 1):
             return None
         return url
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, httpx.InvalidURL):
         return None
 
 
@@ -53,5 +58,5 @@ def resolve(url: str, user_agent: str) -> str | None:
         if not public_https_url(target) or not resolves_publicly(urlsplit(target).hostname or ''):
             return None
         return target
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
         return None

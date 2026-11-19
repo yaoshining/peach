@@ -373,9 +373,6 @@ def stream(request: Request, id: int, session: str = "", decode: str = "", origi
     local_event('playback-request', asset_id=id, method=request.method,
                 range=request.headers.get('range', '')[:80], user_agent=request.headers.get('user-agent', '')[:512])
     asset = state.media_engine.asset(id)
-    # 拖一次进度条就是一串 Range 请求，片源在网盘上时每次 stat 都是一趟网络往返：确认存在时
-    # 取到的那一次 stat 一路传给头修复查询、画像缓存和文件响应，一个请求只问一次。
-    path, source_stat = state.media_engine.filesystem.located(asset)
     from . import direct_playback
     target = direct_playback.mapped_url(state.settings.follow_state_root, asset) if direct else None
     if target and session and state.stream_sessions.is_cancelled(session):
@@ -386,6 +383,10 @@ def stream(request: Request, id: int, session: str = "", decode: str = "", origi
             return RedirectResponse(location, status_code=302, headers={
                 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer',
             })
+        if session:
+            return Response(status_code=503, headers={'Cache-Control': 'no-store'})
+    # 每个 Range 请求只检查一次挂载，供后续响应复用。
+    path, source_stat = state.media_engine.filesystem.located(asset)
     from . import strm, strm_stream
     if strm.is_pointer(path):
         return strm_stream.proxy(request, id, path, session)
@@ -434,7 +435,7 @@ def stream(request: Request, id: int, session: str = "", decode: str = "", origi
 
 
 @router.get("/api/stream-plan")
-def stream_plan(request: Request, id: int, session: str = "", mode: str = "", decode: str = "",
+def stream_plan(request: Request, id: int, session: str = "", mode: str = "", decode: str = "", direct: bool = True,
                 args: dict[str, str] = Depends(require_auth)):
     state = request.app.state
     if session and len(session) > 128:
@@ -442,18 +443,16 @@ def stream_plan(request: Request, id: int, session: str = "", mode: str = "", de
     if session and state.stream_sessions.is_cancelled(session):
         return JSONResponse({"error": "stream cancelled"}, status_code=410)
     asset = state.media_engine.asset(id)
+    from . import direct_playback
+    if direct and direct_playback.mapped_url(state.settings.follow_state_root, asset):
+        suffix = Path(asset.path or '').suffix.lower()
+        mime = {'.mkv': 'video/x-matroska', '.webm': 'video/webm'}.get(suffix, 'video/mp4')
+        return {'id': id, 'protocol': 'range', 'mime_type': mime, 'duration': asset.duration,
+                'src': f'/stream?id={id}&session={quote(session, safe="")}&original=1',
+                'reason': 'direct-playback'}
     plan = state.media_engine.stream_plan(id, mode=mode or "auto")
     # 只有真的能读出关键帧才宣告 HLS，否则客户端会拿到一个必然 404 的播放列表。
     source_path = state.media_engine.filesystem.file_for(asset, thumbnail=False)
-    from . import direct_playback
-    if direct_playback.mapped_url(state.settings.follow_state_root, asset):
-        mime = {'.mkv': 'video/x-matroska', '.webm': 'video/webm'}.get(source_path.suffix.lower(), 'video/mp4')
-        return _record_stream_plan(state, id, source_path, {
-            'id': id, 'protocol': 'range', 'mime_type': mime, 'duration': asset.duration,
-            'src': f'/stream?id={id}&session={quote(session, safe="")}', 'reason': 'direct-playback',
-            'fallback_src': f'/stream?id={id}&session={quote(session, safe="")}&direct=0',
-            'fallback_mime_type': 'video/mp4',
-        })
     from . import strm, strm_stream
     if strm.is_pointer(source_path):
         try:
@@ -473,39 +472,20 @@ def stream_plan(request: Request, id: int, session: str = "", mode: str = "", de
             source_path, session=session, registry=state.stream_sessions, decode=capabilities):
         # 视频浏览器解得了，只差音轨、`hev1` 标签或容器（`.ts` 一类）：`/stream` 整片换封装，不重编码视频。
         conversion, reason = False, "remux"
-    original_trial = conversion and state.transcode_service.original_playable(
+    original_trial = direct and conversion and state.transcode_service.original_playable(
         source_path, session=session, registry=state.stream_sessions, decode=capabilities)
     original_mime = "video/x-matroska" if source_path.suffix.lower() == ".mkv" else "video/mp4"
     resolved = (_hls_plan(state, id, session, conversion)
                 if conversion or plan.protocol == "hls" else None)
     if resolved and session:
-        result = {
-            "id": id,
-            "protocol": "hls",
-            "mime_type": "application/vnd.apple.mpegurl",
-            "duration": round(sum(length for _, length in resolved[2]), 3),
-            "segment_seconds": plan.segment_seconds,
-            "segments": len(resolved[2]),
-            "src": f"/stream/hls/{id}/index.m3u8?session={quote(session, safe='')}",
-            "reason": plan.reason,
-            "processing": resolved[3],
-        }
-        if original_trial:
-            result["original_src"] = f"/stream?id={id}&original=1&session={quote(session, safe='')}"
-            result["original_mime_type"] = original_mime
-        if resolved[3] != "transcode":
-            result["fallback_src"] = f"/stream/hls/{id}/index.m3u8?session={quote(session, safe='')}&transcode=1"
-            result["fallback_mime_type"] = "application/vnd.apple.mpegurl"
+        result = _segmented_stream_plan(id, session, plan, resolved, original_trial, original_mime)
         return _record_stream_plan(state, id, source_path, result, capabilities)
-    source = f"/stream?id={id}"
-    if session:
-        source += f"&session={quote(session, safe='')}"
-    if capabilities:
-        source += f"&decode={','.join(sorted(capabilities))}"
+    source = _range_stream_url(id, session, capabilities, direct)
     result = {
         "id": id,
         "protocol": "range",
-        "mime_type": plan.mime_type,
+        "mime_type": ("video/webm" if not direct and not conversion and reason != "remux"
+                      and source_path.suffix.lower() == ".webm" else plan.mime_type),
         "duration": asset.duration,
         "src": source,
         "reason": reason,
@@ -515,6 +495,34 @@ def stream_plan(request: Request, id: int, session: str = "", mode: str = "", de
         result.update(src=f"/stream?id={id}&original=1&session={quote(session, safe='')}",
                       mime_type=original_mime, fallback_src=source, fallback_mime_type="video/mp4")
     return _record_stream_plan(state, id, source_path, result, capabilities)
+
+
+def _range_stream_url(id, session, capabilities, direct):
+    source = f"/stream?id={id}"
+    if not direct:
+        source += '&direct=0'
+    if session:
+        source += f"&session={quote(session, safe='')}"
+    if capabilities:
+        source += f"&decode={','.join(sorted(capabilities))}"
+    return source
+
+
+def _segmented_stream_plan(id, session, plan, resolved, original_trial, original_mime):
+    src = f"/stream/hls/{id}/index.m3u8?session={quote(session, safe='')}"
+    result = {
+        "id": id, "protocol": "hls", "mime_type": "application/vnd.apple.mpegurl",
+        "duration": round(sum(length for _, length in resolved[2]), 3),
+        "segment_seconds": plan.segment_seconds, "segments": len(resolved[2]),
+        "src": src, "reason": plan.reason, "processing": resolved[3],
+    }
+    if original_trial:
+        result["original_src"] = f"/stream?id={id}&original=1&session={quote(session, safe='')}"
+        result["original_mime_type"] = original_mime
+    if resolved[3] != "transcode":
+        result["fallback_src"] = f"{src}&transcode=1"
+        result["fallback_mime_type"] = "application/vnd.apple.mpegurl"
+    return result
 
 
 def _record_stream_plan(state, asset_id: int, source: Path, plan: dict,

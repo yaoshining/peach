@@ -12,9 +12,9 @@ export function newStreamSession(): string {
   return randomId();
 }
 
-export function directStreamSource(item: PlayerItem, session: string): PlayerSource {
+export function directStreamSource(item: PlayerItem, session: string, direct = true): PlayerSource {
   return {
-    src: `/stream?id=${item.id}&session=${encodeURIComponent(session)}`,
+    src: `/stream?id=${item.id}&session=${encodeURIComponent(session)}${direct ? '' : '&direct=0'}`,
     type: String(item.name || '').toLowerCase().endsWith('.webm') ? 'video/webm' : 'video/mp4',
   };
 }
@@ -29,7 +29,7 @@ export const watchesDecoding = (source: PlayerSource): boolean => Boolean(source
  *  断网时退到转码只会白占服务端。中止（1）一律不算。 */
 function fallbackError(error: unknown, failed: PlayerSource): boolean {
   const code = Number((error as { code?: number } | null)?.code);
-  return code === 3 || code === 4 || (code === 2 && isSegmented(failed));
+  return code === 3 || code === 4 || (code === 2 && (isSegmented(failed) || failed.direct === true));
 }
 
 /** 片源失败时顺次取下一条：原文件 → 保留视频码流的分片 → 视频重编码，同一地址只试一次。
@@ -38,7 +38,7 @@ function fallbackError(error: unknown, failed: PlayerSource): boolean {
  *  正是链上当前那条才前进，重复的那次拿到 null。按能力直放（带 `decode`）的片子链走到头时，
  *  调 `retry`（`fallbackStreamSource`：记下这台浏览器解不了，换一份不报能力的计划）接着退。 */
 export function streamFallbackChain(
-  source: PlayerSource, retry?: () => Promise<PlayerSource>,
+  source: PlayerSource, retry?: (failed: PlayerSource, error: unknown) => Promise<PlayerSource>,
 ): (error: unknown, failed: PlayerSource) => Promise<PlayerSource | null> {
   const tried = new Set([source.src]);
   let current = source, pending = retry, spent: PlayerSource | null = null;
@@ -46,10 +46,10 @@ export function streamFallbackChain(
     if (failed !== current || spent === current || !fallbackError(error, failed)) return null;
     spent = current;
     let next = current.fallback;
-    if (!next && current.decode && pending) {
+    if (!next && (current.decode || current.direct) && pending) {
       const load = pending;
       pending = undefined;
-      next = await load().catch(() => undefined);
+      next = await load(current, error).catch(() => undefined);
     }
     if (!next || tried.has(next.src)) return null;
     tried.add(next.src);
@@ -72,21 +72,22 @@ function followStreamSource(item: PlayerItem): PlayerSource | null {
  *  计划带上这台浏览器的解码能力（`decode=`，ADR-0163）：报了能解 HEVC，HEVC 片子直放原文件。
  *  回来的片源记着报了什么（`decode`），播放器据此决定要不要盯着首帧、解不出来时换 `fallbackStreamSource`。 */
 export async function playableStreamSource(
-  item: PlayerItem, session: string, hevc: HevcPlayback = 'auto',
+  item: PlayerItem, session: string, hevc: HevcPlayback = 'auto', direct = true,
 ): Promise<PlayerSource> {
   const proxied = followStreamSource(item);
   if (proxied) return proxied;
   const decode = await decodeParam(hevc).catch(() => '');
   try {
     const plan = await api(`/api/stream-plan?id=${item.id}&session=${encodeURIComponent(session)}`
-      + (decode ? `&decode=${decode}` : '')) as
+      + (decode ? `&decode=${decode}` : '') + (direct ? '' : '&direct=0')) as
       { protocol?: string; src?: string; mime_type?: string; original_src?: string; original_mime_type?: string;
-        fallback_src?: string; fallback_mime_type?: string } | null;
+        fallback_src?: string; fallback_mime_type?: string; reason?: string } | null;
     if (plan?.src) {
       const hls = plan.protocol === 'hls';
       const original = !hls && plan.src.includes('original=1');
       const planned: PlayerSource = { src: plan.src, type: plan.mime_type || (hls ? 'application/vnd.apple.mpegurl' : 'video/mp4'),
-        ...(decode && !hls ? { decode } : {}), ...(original ? { trial: true } : {}) };
+        ...(decode && !hls ? { decode } : {}), ...(original ? { trial: true } : {}),
+        ...(plan.reason === 'direct-playback' ? { direct: true } : {}) };
       if (plan.fallback_src) {
         planned.fallback = { src: plan.fallback_src, type: plan.fallback_mime_type || 'application/vnd.apple.mpegurl' };
       }
@@ -96,13 +97,13 @@ export async function playableStreamSource(
       return planned;
     }
   } catch { /* 取不到计划就直读 */ }
-  return directStreamSource(item, session);
+  return directStreamSource(item, session, direct);
 }
 
 /** 报了能解却解不出来：这台浏览器记下失败（此后 30 天不再报 HEVC），换一份不报能力的计划。 */
-export function fallbackStreamSource(item: PlayerItem, session: string): Promise<PlayerSource> {
-  rememberDecodeFailure();
-  return playableStreamSource(item, session, 'transcode');
+export function fallbackStreamSource(item: PlayerItem, session: string, bypassDirect = false, networkError = false): Promise<PlayerSource> {
+  if (!networkError) rememberDecodeFailure();
+  return playableStreamSource(item, session, 'transcode', !bypassDirect);
 }
 
 /** 通知服务端放掉这一路读取。结果写到 `<html data-peach-stream-cancel>` 上，e2e 据此核对。 */
@@ -129,7 +130,8 @@ function ensureDetailSession(): string {
 
 export const directDetailSource = (item: PlayerItem): PlayerSource => directStreamSource(item, ensureDetailSession());
 export const detailStreamSource = (item: PlayerItem): Promise<PlayerSource> => playableStreamSource(item, ensureDetailSession());
-export const detailFallbackSource = (item: PlayerItem): Promise<PlayerSource> => fallbackStreamSource(item, ensureDetailSession());
+export const detailFallbackSource = (item: PlayerItem, bypassDirect = false, networkError = false): Promise<PlayerSource> =>
+  fallbackStreamSource(item, ensureDetailSession(), bypassDirect, networkError);
 
 export function cancelDetailStream(): void {
   const session = detailSession;

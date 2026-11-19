@@ -170,7 +170,7 @@ class StrmPlaybackTests(unittest.TestCase):
                 response = client.get('/stream?id=1&session=one', headers={'User-Agent': 'player-test'},
                                       follow_redirects=False)
         self.assertEqual(plan['reason'], 'direct-playback')
-        self.assertIn('direct=0', plan['fallback_src'])
+        self.assertIn('original=1', plan['src'])
         self.assertNotIn('example', json.dumps(plan))
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers['location'], 'https://cdn.example/video?secret=1')
@@ -184,7 +184,7 @@ class StrmPlaybackTests(unittest.TestCase):
                              [(1, 30)])
         with patch('peach.direct_playback.resolve', return_value=None), route_client(self.app) as client:
             fallback = client.get('/stream?id=1&session=one&original=1')
-        self.assertEqual((fallback.status_code, fallback.content), (200, b'original'))
+        self.assertEqual(fallback.status_code, 503)
         with patch('peach.direct_playback.resolve') as resolve, route_client(self.app) as client:
             fallback = client.get('/stream?id=1&session=one&original=1&direct=0')
         resolve.assert_not_called()
@@ -200,7 +200,10 @@ class StrmPlaybackTests(unittest.TestCase):
         self.assertEqual(direct_playback.mapped_url(self.root, asset), valid)
         for path, url in (('R:\\media\\other.mp4', valid),
                           (asset.path, 'https://public.example/115/newurl?pickcode=a&userid=42'),
-                          (asset.path, 'http://127.0.0.1:12333/admin?pickcode=a&userid=42')):
+                          (asset.path, 'http://127.0.0.1:12333/admin?pickcode=a&userid=42'),
+                          (asset.path, 'http://127.0.0.1:12333/115/url/../../admin?pickcode=a&userid=42'),
+                          (asset.path, 'http://127.0.0.1:12333/115/url/%2e%2e/admin?pickcode=a&userid=42'),
+                          (asset.path, valid + 'x' * 65536)):
             write(path, url)
             self.assertIsNone(direct_playback.mapped_url(self.root, asset))
 
@@ -217,6 +220,38 @@ class StrmPlaybackTests(unittest.TestCase):
         with route_client(self.app) as client:
             result = client.get('/api/stream-plan?id=1').json()
         self.assertEqual((result['reason'], result['mime_type']), ('direct-playback', 'video/webm'))
+        with patch('peach.routes_media._needs_conversion', return_value=False), route_client(self.app) as client:
+            fallback = client.get('/api/stream-plan?id=1&direct=0').json()
+        self.assertEqual((fallback['mime_type'], fallback['src']), ('video/webm', '/stream?id=1&direct=0'))
+
+    def test_direct_playback_does_not_read_offline_mount_and_replans_hls_on_failure(self):
+        asset_path = self.root / 'offline.mp4'
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('UPDATE asset SET path=?,name=?,duration=120 WHERE id=1', (str(asset_path), 'offline.mp4'))
+        state = self.root / 'state'
+        state.mkdir(exist_ok=True)
+        (state / direct_playback.FILENAME).write_text(json.dumps({'assets': {'1': {
+            'path': str(asset_path), 'location': 'local',
+            'url': 'http://127.0.0.1:12333/115/newurl?pickcode=example&userid=42'}}}), encoding='utf-8')
+        filesystem = self.app.state.media_engine.filesystem
+        with patch.object(filesystem, 'file_for', side_effect=AssertionError('mount read')), \
+                patch.object(filesystem, 'located', side_effect=AssertionError('mount read')), \
+                patch('peach.direct_playback.resolve', return_value='https://cdn.example/video'):
+            with route_client(self.app) as client:
+                plan = client.get('/api/stream-plan?id=1&session=one').json()
+                response = client.get(plan['src'], follow_redirects=False)
+        self.assertEqual((plan['reason'], response.status_code), ('direct-playback', 302))
+        asset_path.write_bytes(b'video')
+        service = self.app.state.transcode_service
+        with patch('peach.routes_media._needs_conversion', return_value=True), \
+                patch.object(service, 'remuxes', return_value=False), \
+                patch('peach.routes_media._hls_plan', return_value=(None, None, [(0, 6)], 'transcode')), \
+                route_client(self.app) as client:
+            fallback = client.get('/api/stream-plan?id=1&session=one&direct=0').json()
+        self.assertEqual((fallback['protocol'], fallback['mime_type']), ('hls', 'application/vnd.apple.mpegurl'))
+
+    def test_invalid_httpx_url_falls_back_without_raising(self):
+        self.assertIsNone(direct_playback.resolve('http://127.0.0.1:12333/' + 'x' * 65536, 'test'))
 
     def test_direct_resolver_does_not_follow_or_accept_nonpublic_redirects(self):
         request = httpx.Request('GET', 'http://127.0.0.1:12333/115/newurl')
