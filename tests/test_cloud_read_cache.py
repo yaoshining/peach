@@ -143,13 +143,42 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code,410)
 
     async def test_local_files_and_disable_setting_bypass_cache(self):
-        from peach import config
-        settings=SimpleNamespace(mounts={'115':('/cloud/CloudDrive/JAV',),'pikpak':('/pikpak',)})
-        with patch.object(config,'_SETTINGS',settings):
+        from peach import config, platform, settings_file
+        mounts={'115':('/cloud/CloudDrive/JAV',),'pikpak':('/pikpak',)}
+        with patch.object(platform, 'location_mount_values', return_value=mounts), \
+                patch.object(config, 'GENERATED_DIR', self.root), \
+                patch.object(settings_file, 'active', return_value=SimpleNamespace(locations={})):
             self.assertIsNone(c.cache_for(Path('/media/a.mp4')))
             self.assertIsNone(c.cache_for(Path('/pikpak/a.jpg')))
             with patch.dict(os.environ,{'PEACH_CLOUD_READ_CACHE_BYTES':'0'}):
                 self.assertIsNone(c.cache_for(Path('/pikpak/a.mp4')))
+
+    async def test_override_and_windows_direct_roots(self):
+        from peach import config, settings_file
+        settings = SimpleNamespace(mounts={'115': ('/old',)}, locations={'115': ('/declared',)})
+        with patch.object(settings_file, 'active', return_value=settings), \
+                patch.object(config, 'GENERATED_DIR', self.root), \
+                patch.dict(os.environ, {'PEACH_MEDIA_MOUNTS': '115=/new'}):
+            self.assertIsNotNone(c.cache_for(Path('/new/a.mp4')))
+            self.assertIsNone(c.cache_for(Path('/old/a.mp4')))
+        self.assertEqual(c._cloud_roots({}, settings.locations, True), [Path('/declared')])
+        self.assertEqual(c._cloud_roots({}, settings.locations, False), [])
+
+    async def test_cached_reads_do_not_wait_for_anyio_default_limiter(self):
+        import anyio.to_thread
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        previous = limiter.total_tokens
+        limiter.total_tokens = 1
+        await limiter.acquire()
+        try:
+            response = await asyncio.wait_for(self.request(
+                headers={'Range': 'bytes=0-1048575'},
+                response=BufferedFileResponse(self.source, stat_result=self.source.stat())), 5)
+        finally:
+            limiter.release()
+            limiter.total_tokens = previous
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, self.data[:c.BLOCK_SIZE])
 
     async def test_cancelled_read_stops_without_filling_blocks(self):
         entered=asyncio.Event()

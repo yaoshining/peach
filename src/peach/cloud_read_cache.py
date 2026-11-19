@@ -13,11 +13,14 @@ import tempfile
 import threading
 import weakref
 
-import anyio
-
 LOGGER = logging.getLogger(__name__)
 BLOCK_SIZE = 1 << 20
 MIN_FILL = 64 << 10
+
+
+async def _stream_io(function, *args):
+    from .streaming import _stream_thread
+    return await _stream_thread(function, *args)
 
 
 class BlockCache:
@@ -148,10 +151,10 @@ class CachedReader:
 
     async def _read_origin(self, start: int, size: int):
         if self.origin is None:
-            self.origin = await anyio.open_file(self.source, 'rb')
+            self.origin = await _stream_io(open, self.source, 'rb')
         if self.origin_position != start:
-            await self.origin.seek(start)
-        data = await self.origin.read(size)
+            await _stream_io(self.origin.seek, start)
+        data = await _stream_io(self.origin.read, size)
         self.origin_position = start + len(data)
         return data
 
@@ -166,18 +169,18 @@ class CachedReader:
             base = index * BLOCK_SIZE
             expected = min(BLOCK_SIZE, self.size - base)
             take = min(wanted, expected - offset)
-            block = await anyio.to_thread.run_sync(self.cache.get, self.key, index, expected)
+            block = await _stream_io(self.cache.get, self.key, index, expected)
             if block is None and take < MIN_FILL:
                 # Safari 的 bytes=0-1 等探测不得触发 1 MiB 下载。
                 data = await self._read_origin(self.position, take)
             else:
                 if block is None:
                     async with self.cache.lock(f'{self.key}:{index}'):
-                        block = await anyio.to_thread.run_sync(self.cache.get, self.key, index, expected)
+                        block = await _stream_io(self.cache.get, self.key, index, expected)
                         if block is None:
                             block = await self._read_origin(base, expected)
                             if len(block) == expected:
-                                await anyio.to_thread.run_sync(self.cache.put, self.key, index, block)
+                                await _stream_io(self.cache.put, self.key, index, block)
                 data = block[offset:offset + take]
             pieces.append(data)
             self.position += len(data)
@@ -188,20 +191,26 @@ class CachedReader:
 
     async def aclose(self):
         if self.origin is not None:
-            with anyio.CancelScope(shield=True):
-                await self.origin.aclose()
+            await asyncio.shield(_stream_io(self.origin.close))
 
 
 _DEFAULT = None
 
 
+def _cloud_roots(mounts, locations, windows):
+    return [Path(root) for location in ('115', 'pikpak')
+            for root in (*mounts.get(location, ()), *(locations.get(location, ()) if windows else ()))]
+
+
 def cache_for(path: Path):
     global _DEFAULT
-    from . import config
+    from . import config, platform, settings_file
     if path.suffix.lower() not in {'.mp4', '.m4v', '.webm', '.mov', '.mkv', '.avi', '.ts'}:
         return None
-    roots = [Path(root) for location in ('115', 'pikpak') for root in config._SETTINGS.mounts.get(location, ())]
-    if not any(path.is_relative_to(root) for root in roots):
+    mounts = platform.location_mount_values()
+    locations = settings_file.active().locations
+    roots = _cloud_roots(mounts, locations, os.name == 'nt')
+    if not any(platform.within_root(path, root) for root in roots):
         return None
     try:
         budget = int(os.environ.get('PEACH_CLOUD_READ_CACHE_BYTES', str(4 << 30)))
@@ -216,7 +225,7 @@ def cache_for(path: Path):
 
 @asynccontextmanager
 async def open_cached(path: Path, cache: BlockCache):
-    st = await anyio.to_thread.run_sync(path.stat)
+    st = await _stream_io(path.stat)
     reader = CachedReader(path, st, cache)
     try:
         yield reader

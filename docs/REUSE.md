@@ -1,6 +1,6 @@
 # 复用清单
 
-网盘播放缓存复用现有 `FileResponse` 的 Range 处理，只缓存请求过的块；缓存失败回退源文件。手动封面复用 `LibraryMetadataProvider` 和 `verified_cover` 的来源查询与图片核验；手动抓取时才允许带水印的 JavDB 图片，自动采集继续遵循原设置。异步文件操作复用已锁定的 AnyIO 4.16.0。
+网盘播放缓存复用现有 `FileResponse` 的 Range 处理和送流线程池，只缓存请求过的块；缓存失败回退源文件。手动封面复用 `LibraryMetadataProvider` 和 `verified_cover` 的来源查询与图片核验；手动抓取时才允许带水印的 JavDB 图片，自动采集继续遵循原设置。
 
 ## 内容与骨架的显示边界
 
