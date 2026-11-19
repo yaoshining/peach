@@ -296,6 +296,7 @@ class DependencyPolicyTests(unittest.TestCase):
             "cv2": "opencv-python-headless",
             "dmgbuild": "dmgbuild",
             "ebmlite": "ebmlite",
+            "anyio": "anyio",
             "fastapi": "fastapi",
             "filelock": "filelock",
             "google": "protobuf",

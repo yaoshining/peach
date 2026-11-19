@@ -1254,6 +1254,7 @@ wheels = [
 name = "peach"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "apscheduler" },
     { name = "beautifulsoup4" },
     { name = "bencode2" },
@@ -1317,6 +1318,7 @@ vision = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = "==4.16.0" },
     { name = "apscheduler", specifier = "==3.11.3" },
     { name = "beautifulsoup4", specifier = "==4.15.0" },
     { name = "bencode2", specifier = "==0.3.38" },

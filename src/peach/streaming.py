@@ -202,6 +202,12 @@ class BufferedFileResponse(FileResponse):
         Starlette 三种发法（整份、单段、多段）都经这里拿文件，只用 `read` 与 `seek`。
         关闭也在这组线程里做，并且护住：发送被取消时也照样关掉。
         """
+        from .cloud_read_cache import cache_for, open_cached
+        cache = cache_for(Path(self.path))
+        if cache is not None:
+            async with open_cached(Path(self.path), cache) as cached:
+                yield cached
+            return
         handle = await _stream_thread(open, self.path, "rb")
         try:
             yield _StreamFile(handle)

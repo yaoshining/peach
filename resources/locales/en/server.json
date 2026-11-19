@@ -3168,6 +3168,7 @@
     "webScraping": {
       "compareIncompleteMobileHint": ", so the cover comparison didn't finish. On China Mobile broadband, direct connections to DMM image hosts are often dropped after the handshake; set the DMM / FANZA connection to the Peach proxy.",
       "coverSaved": "HD cover saved",
+      "communityCoverSaved": "Community cover saved (source: {{source}}, may contain a watermark)",
       "diagnosticDimensionMismatch": " Full image size didn't match the probe: {{count}}",
       "diagnosticDownloadFailed": " Full downloads failed: {{count}}",
       "diagnosticInvalidImage": " Images that couldn't be decoded: {{count}}",
