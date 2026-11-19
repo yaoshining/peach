@@ -704,6 +704,17 @@ class ScrapingAccessTests(unittest.TestCase):
             self.assertTrue(verify.call_args.kwargs["allow_watermarked"])
             provider.close.assert_called_once()
 
+    def test_manual_community_timeout_preserves_official_connection_error(self):
+        from peach.web_scraping import _manual_cover_candidate
+        from peach.jav_cover_fetch import CoverConnectError, DeadlineExceeded
+        contract = SimpleNamespace(follow_sources_root=self.root)
+        official = CoverConnectError('errors.javCoverFetch.hostsUnreachable')
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=official), \
+                patch('peach.web_scraping._community_cover', side_effect=DeadlineExceeded('errors.libraryProcessing.deadlineRetryLater')):
+            with self.assertRaises(CoverConnectError) as caught:
+                _manual_cover_candidate(contract, 'ABW-232', None, (), {})
+        self.assertIs(caught.exception, official)
+
     def test_cached_manual_community_cover_still_shows_source(self):
         from peach.web_scraping import _fetch_cover
         import hashlib

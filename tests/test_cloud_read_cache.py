@@ -91,6 +91,23 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(blocks),1)
         self.assertEqual(blocks[0].stat().st_mode & 0o777,0o600)
 
+    async def test_failed_initial_scan_retries_before_enforcing_capacity(self):
+        self.cache.directory.mkdir()
+        existing = self.cache.directory / 'old-0.block'
+        existing.write_bytes(b'a' * c.BLOCK_SIZE)
+        cache = c.BlockCache(self.cache.directory, max_bytes=c.BLOCK_SIZE, min_free=0)
+        original = Path.stat
+        def fail_existing(path, *args, **kwargs):
+            if path == existing:
+                raise PermissionError('temporary error')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'stat', fail_existing):
+            self.assertIsNone(cache.get('new', 0, c.BLOCK_SIZE))
+        self.assertIsNone(cache._entries)
+        cache.put('new', 0, b'b' * c.BLOCK_SIZE)
+        self.assertEqual(sum(p.stat().st_size for p in cache.directory.glob('*.block')), c.BLOCK_SIZE)
+        self.assertFalse(existing.exists())
+
     async def test_low_disk_space_keeps_playing_without_cache(self):
         with patch.object(c.shutil,'disk_usage',return_value=SimpleNamespace(free=0)):
             async with c.open_cached(self.source,self.cache) as f:

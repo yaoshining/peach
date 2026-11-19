@@ -141,7 +141,7 @@ def _cached_manual_cover(target, code):
 
 
 def _manual_cover_candidate(contract, code, observed, prior, diagnostics):
-    from .jav_cover_fetch import best_cover, Unavailable
+    from .jav_cover_fetch import best_cover, DeadlineExceeded, Unavailable
     try:
         candidate, size, data = best_cover(observed, code, 0, diagnostics=diagnostics,
                                           prior_candidates=prior,
@@ -151,7 +151,7 @@ def _manual_cover_candidate(contract, code, observed, prior, diagnostics):
         try:
             candidate, size, data, verified_by = _community_cover(contract, code)
             return candidate, size, data, verified_by, True
-        except (Unavailable, SourcePaused):
+        except (Unavailable, SourcePaused, DeadlineExceeded):
             raise official_error
 
 

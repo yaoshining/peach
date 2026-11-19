@@ -38,7 +38,8 @@ class BlockCache:
         if self._entries is not None:
             return
         self.directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-        self._entries = OrderedDict()
+        entries = OrderedDict()
+        used = 0
         files = []
         for p in self.directory.glob('*.block'):
             try:
@@ -47,8 +48,10 @@ class BlockCache:
             except FileNotFoundError:
                 pass
         for _, p, size in sorted(files):
-            self._entries[p] = size
-            self._used += size
+            entries[p] = size
+            used += size
+        self._entries = entries
+        self._used = used
         self._trim(0)
 
     def _trim(self, additional: int):
