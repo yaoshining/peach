@@ -90,6 +90,19 @@ describe('起播计划带上能力', () => {
       src: '/stream?id=7&session=s&direct=0', type: 'video/mp4',
     });
   });
+  it('初始播放计划请求失败时绕过直链', async () => {
+    browserDecodes([]);
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }));
+    expect(await playableStreamSource({ id: 7 }, 's')).toEqual({
+      src: '/stream?id=7&session=s&direct=0', type: 'video/mp4',
+    });
+  });
+  it('直链格式错误不记录全局 HEVC 解码失败', async () => {
+    browserDecodes(['hvc1.1.6']);
+    plans();
+    await fallbackStreamSource({ id: 7 }, 's', true, false);
+    expect(await decodeParam()).toBe('hevc');
+  });
   it('报了能解时计划带 decode，片源记着它；回退时记下失败、换不带能力的计划', async () => {
     browserDecodes(['hvc1.1.6']);
     const urls = plans();

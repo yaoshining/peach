@@ -97,12 +97,12 @@ export async function playableStreamSource(
       return planned;
     }
   } catch { /* 取不到计划就直读 */ }
-  return directStreamSource(item, session, direct);
+  return directStreamSource(item, session, false);
 }
 
 /** 报了能解却解不出来：这台浏览器记下失败（此后 30 天不再报 HEVC），换一份不报能力的计划。 */
 export function fallbackStreamSource(item: PlayerItem, session: string, bypassDirect = false, networkError = false): Promise<PlayerSource> {
-  if (!networkError) rememberDecodeFailure();
+  if (!networkError && !bypassDirect) rememberDecodeFailure();
   return playableStreamSource(item, session, 'transcode', !bypassDirect);
 }
 
